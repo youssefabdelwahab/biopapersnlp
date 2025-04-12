@@ -66,9 +66,25 @@ async def extract_all_papers():
                 else:
                     pdf_href = agent.one_turn(
                         system_prompt="""
-                            You are an assistant that analyzes the HTML of academic paper webpages to extract the direct PDF download link.
-                            ... (prompt omitted for brevity) ...
-                        """,
+                        You are an assistant that analyzes the HTML of academic paper webpages to extract the direct PDF download link.
+
+                        Given the URL to a scientific paper, perform the following:
+                        1. Follow any redirects to land on the final page hosting the full paper.
+                        2. Analyze the HTML and look for anchor (`<a>`) tags that link to PDF documents.
+                           - These usually contain "pdf" in the `href`
+                           - May use a button or text like "Download PDF", "View PDF", etc.
+                        3. Return only the absolute URL to the actual `.pdf` file — it must be a direct link to a downloadable PDF (not an HTML viewer or embedded viewer).
+                        4. If a PDF link contains `download=true`, return the **same link with `download=false` instead**.
+                        5. Do not include any commentary or analysis
+
+                        Examples:
+                        Input: https://doi.org/10.1111/bph.15505
+                        Output: https://bpspubs.onlinelibrary.wiley.com/doi/pdfdirect/10.1111/bph.15505?download=true
+                        Input: https://www.biorxiv.org/content/10.1101/2020.06.02.130062v2
+                        Output: https://www.biorxiv.org/content/10.1101/2020.06.02.130062v2.full.pdf
+                        Input: https://bpspubs.onlinelibrary.wiley.com/doi/pdfdirect/10.1111/bph.15505?download=true
+                        Output: https://bpspubs.onlinelibrary.wiley.com/doi/pdfdirect/10.1111/bph.15505?download=False
+                            """,
                         user_prompt=paper_url
                     )
                     relevant_text = await extract_text_from_pdf_via_browser(pdf_href)
@@ -84,9 +100,14 @@ async def extract_all_papers():
                 for chunk in chunks:
                     cleaned_chunk = agent.one_turn(
                         system_prompt="""
-                            The following text is extracted from a research paper. Your task is to:
-                            ... (cleaning prompt omitted for brevity) ...
-                        """,
+                        The following text is extracted from a research paper. Your task is to:
+                        - Clean it up
+                        - Keep only the **main body content**
+                        - Remove footnotes, references, figure captions, and legal disclaimers.
+                        - Ensure proper paragraph structure and readability.
+                        - Preserve the logical order of content.
+                        - Do not include any commentary or analysis
+                    """,
                         user_prompt=chunk
                     )
                     chunk_text_storage.append(cleaned_chunk)
