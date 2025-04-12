@@ -8,9 +8,22 @@ import random
 import os
 import httpx
 from dotenv import load_dotenv
+import logging
 
 load_dotenv()
 
+log_folder = os.path.join(os.path.dirname(__file__), "..", "Logs")
+os.makedirs(log_folder, exist_ok=True)
+log_file_path = os.path.join(log_folder, "extraction.log")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(log_file_path),
+        logging.StreamHandler()  
+    ]
+)
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -68,7 +81,7 @@ async def extract_text_from_pdf_via_browser(landing_url: str):
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(
-                headless=False,
+                headless=True,
                 args=[
                     "--disable-blink-features=AutomationControlled",
                     "--disable-web-security",
@@ -92,7 +105,7 @@ async def extract_text_from_pdf_via_browser(landing_url: str):
                 from playwright_stealth import stealth_async
                 await stealth_async(page)
             except ImportError:
-                print("playwright_stealth not installed; continuing without stealth")
+                logging.warning("playwright_stealth not installed; continuing without stealth")
 
             print(f"Navigating to EZProxy URL: {proxied_url}")
             await page.goto(proxied_url, wait_until="load")
@@ -136,7 +149,7 @@ async def extract_text_from_pdf_via_browser(landing_url: str):
                             text = extract_pdf(content)
                             if text: return text
             except Exception as e:
-                print(f"⚠️ Failed extracting nested class-based PDF link: {e}")
+                print(f"Failed extracting nested class-based PDF link: {e}")
 
             print("Attempting fallback reconstruction from epdf link...")
             epdf_url = landing_url
@@ -188,11 +201,11 @@ async def extract_text_from_pdf_via_browser(landing_url: str):
                 print("PDF fetched directly from landing URL.")
                 return extract_pdf(response.content)
 
-        print("All extraction methods failed.")
+        logging.warning(f"All extraction methods failed for {landing_url}.")
         return None
 
     except Exception as e:
-        print(f"Error during extraction: {e}")
+        logging.error(f"{landing_url} faced errors during extraction: {e}")
         return None
 
 
@@ -203,7 +216,7 @@ async def get_biorxiv_pdf_link(article_url: str) -> str:
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(
-                headless=False,
+                headless=True,
                 args=[
                     "--disable-blink-features=AutomationControlled",
                     "--disable-web-security",
@@ -233,7 +246,7 @@ async def get_biorxiv_pdf_link(article_url: str) -> str:
                 from playwright_stealth import stealth_async
                 await stealth_async(page)
             except ImportError:
-                print("playwright-stealth not installed. Proceeding without stealth mode.")
+                logging.warning("playwright_stealth not installed; continuing without stealth")
 
             print(f"Navigating to: {article_url}")
             await page.goto(article_url, wait_until="networkidle")
@@ -286,6 +299,6 @@ async def get_biorxiv_pdf_link(article_url: str) -> str:
                 return extracted_text
 
     except Exception as e:
-        print(f"Error: {e}")
+        logging.error(f"{article_url} faced errors: {e}")
         return None
 
