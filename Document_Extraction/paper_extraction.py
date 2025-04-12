@@ -1,4 +1,7 @@
 import os
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 from dotenv import load_dotenv
 import asyncio
 import csv
@@ -6,6 +9,7 @@ from functions_and_classes.bioarxiv_class import *
 from functions_and_classes.functions import *
 from LLM_Agent.llm_template import LLMAgent
 from selenium.common.exceptions import TimeoutException
+import sys
 
 load_dotenv()
 
@@ -17,7 +21,7 @@ os.makedirs(unextract_save_folder, exist_ok=True)
 
 extract_file_name = os.path.join(extract_save_folder, "extracted_papers.csv")
 unextract_file_name = os.path.join(unextract_save_folder, "extracted_papers.csv")
-year_range_str = "2020-01-01/2025-01-01/1"
+year_range_str = "2018-01-01/2025-01-01/1"
 
 api_key = os.getenv("OPENAI_API_KEY")
 model_name = 'Llama-3-8B-Instruct-exl2'
