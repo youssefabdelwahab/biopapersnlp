@@ -10,17 +10,18 @@ from functions_and_classes.functions import *
 from LLM_Agent.llm_template import LLMAgent
 from selenium.common.exceptions import TimeoutException
 import sys
+import json
 
 load_dotenv()
 
-repo_root = os.path.dirname(os.path.abspath(__file__))
+repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 extract_save_folder = os.path.join(repo_root, "papers", "extracted_papers")
 unextract_save_folder = os.path.join(repo_root, "papers", "unextracted_papers")
 os.makedirs(extract_save_folder, exist_ok=True)
 os.makedirs(unextract_save_folder, exist_ok=True)
 
-extract_file_name = os.path.join(extract_save_folder, "extracted_papers.csv")
-unextract_file_name = os.path.join(unextract_save_folder, "extracted_papers.csv")
+extract_file_name = os.path.join(extract_save_folder, "extracted_papers.json")
+unextract_file_name = os.path.join(unextract_save_folder, "unextracted_papers.json")
 year_range_str = "2018-01-01/2025-01-01/1"
 
 api_key = os.getenv("OPENAI_API_KEY")
@@ -34,7 +35,7 @@ async def extract_all_papers():
     global paper_metadeta_approved_list, paper_metadeta_unextracted_list
     paper_metadeta_approved_list = []
     paper_metadeta_unextracted_list = []
-    count = 2000
+    count = 0
 
     for paper in paper_metadata:
         doi_types = {
@@ -100,13 +101,18 @@ async def extract_all_papers():
                 for chunk in chunks:
                     cleaned_chunk = agent.one_turn(
                         system_prompt="""
-                        The following text is extracted from a research paper. Your task is to:
+                       The following text is a *partial excerpt* from a research paper. Your task is to:
+
                         - Clean it up
                         - Keep only the **main body content**
-                        - Remove footnotes, references, figure captions, and legal disclaimers.
+                        - Remove footnotes, references, citations, figure captions, and legal disclaimers.
                         - Ensure proper paragraph structure and readability.
-                        - Preserve the logical order of content.
-                        - Do not include any commentary or analysis
+                        - Preserve the logical order within this chunk only.
+                        - Do not include any commentary, analysis, or information not present in the chunk.
+                        - Do not attempt to infer or hallucinate missing parts from previous or next sections.
+                        - Do not include any commentary 
+
+                        This is only one chunk of a longer paper. Treat each chunk independently unless otherwise told.
                     """,
                         user_prompt=chunk
                     )
@@ -158,27 +164,19 @@ async def extract_all_papers():
             paper_metadeta_unextracted_list.append(paper_dict)
             print("Could not Get Published and PrePrint Paper Pairs, stored paper info and moving on...")
 
-        if count >= 2000:
+        if count >= 1:
+            print(f"Extracted {count} papers")
             break 
-        print(f"Extracted {count} papers")
 
 if __name__ == "__main__":
     asyncio.run(extract_all_papers())
 
     if paper_metadeta_approved_list:
-        with open(extract_file_name, 'w', newline='', encoding='utf-8') as file:
-            fieldnames = paper_metadeta_approved_list[0].keys()
-            writer = csv.DictWriter(file, fieldnames=fieldnames)
-            writer.writeheader()
-            for full_metadata_dict in paper_metadeta_approved_list:
-                writer.writerow(full_metadata_dict)
-        print(f"Extract File saved to: {extract_save_folder}")
+        with open(extract_file_name, 'w', encoding='utf-8') as file:
+            json.dump(paper_metadeta_approved_list, file, ensure_ascii=False, indent=2)
+        print(f"Extract File saved to: {extract_file_name}")
 
     if paper_metadeta_unextracted_list:
-        with open(unextract_file_name, 'w', newline='', encoding='utf-8') as file:
-            fieldnames = paper_metadeta_unextracted_list[0].keys()
-            writer = csv.DictWriter(file, fieldnames=fieldnames)
-            writer.writeheader()
-            for full_metadata_dict in paper_metadeta_unextracted_list:
-                writer.writerow(full_metadata_dict)
-        print(f"Unextract File saved to: {unextract_save_folder}")
+        with open(unextract_file_name, 'w', encoding='utf-8') as file:
+            json.dump(paper_metadeta_unextracted_list, file, ensure_ascii=False, indent=2)
+        print(f"Unextract File saved to: {unextract_file_name}")
