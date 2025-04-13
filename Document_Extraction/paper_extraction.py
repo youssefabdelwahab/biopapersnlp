@@ -43,7 +43,11 @@ async def extract_all_papers():
             'published_doi': f"https://doi.org/{paper['published_doi']}"
         }
 
-        research_text_bucket = []
+        research_text_bucket = {
+            "preprint_doi": None,
+            "published_doi": None
+                }
+
         paper_dict = {
             "preprint_doi": "",
             "published_doi": "",
@@ -119,7 +123,8 @@ async def extract_all_papers():
                     chunk_text_storage.append(cleaned_chunk)
 
                 cleaned_text = " ".join(chunk_text_storage)
-                research_text_bucket.append(cleaned_text)
+                research_text_bucket[paper_key] = cleaned_text
+
 
             except TimeoutException:
                 print('Time out while loading')
@@ -128,7 +133,7 @@ async def extract_all_papers():
                 print(e)
                 continue
 
-        if len(research_text_bucket) == 2:
+        if research_text_bucket["preprint_doi"] and research_text_bucket["published_doi"]:
             paper_dict.update({
                 "preprint_doi": paper["preprint_doi"],
                 "published_doi": paper["published_doi"],
@@ -158,8 +163,8 @@ async def extract_all_papers():
                 "published_date": paper["published_date"],
                 "preprint_author_corresponding": paper["preprint_author_corresponding"],
                 "preprint_author_corresponding_institution": paper["preprint_author_corresponding_institution"],
-                "preprint_paper": "N/A",
-                "published_paper": 'N/A'
+                "preprint_paper": research_text_bucket["preprint_doi"] or "N/A",
+                "published_paper": research_text_bucket["published_doi"] or "N/A"
             })
             paper_metadeta_unextracted_list.append(paper_dict)
             print("Could not Get Published and PrePrint Paper Pairs, stored paper info and moving on...")
