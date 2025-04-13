@@ -92,7 +92,8 @@ async def extract_all_papers():
                             """,
                         user_prompt=paper_url
                     )
-                    relevant_text = await extract_text_from_pdf_via_browser(pdf_href)
+                    clean_href = pdf_href.strip()
+                    relevant_text = await extract_text_from_pdf_via_browser(clean_href)
 
                 if relevant_text is None:
                     print(f"Could not Get {paper_key} Paper .. moving to next paper")
@@ -117,6 +118,7 @@ async def extract_all_papers():
                         - Do not include any commentary 
 
                         This is only one chunk of a longer paper. Treat each chunk independently unless otherwise told.
+                        Return ONLY the cleaned and readable main body text from the input. DO NOT add any commentary, introduction, summary, or instructional text.
                     """,
                         user_prompt=chunk
                     )
@@ -145,8 +147,8 @@ async def extract_all_papers():
                 "published_date": paper["published_date"],
                 "preprint_author_corresponding": paper["preprint_author_corresponding"],
                 "preprint_author_corresponding_institution": paper["preprint_author_corresponding_institution"],
-                "preprint_paper": research_text_bucket[0],
-                "published_paper": research_text_bucket[1]
+                "preprint_paper": research_text_bucket["preprint_doi"],
+                "published_paper": research_text_bucket["published_doi"]
             })
             paper_metadeta_approved_list.append(paper_dict)
             count += 1
