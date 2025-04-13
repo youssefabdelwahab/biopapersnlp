@@ -110,7 +110,7 @@ async def extract_text_from_pdf_via_browser(landing_url: str):
 
             print(f"Navigating to EZProxy URL: {proxied_url}")
             await page.goto(proxied_url, wait_until="load")
-            await page.wait_for_timeout(30000)
+            await page.wait_for_timeout(50000)
 
             current_url = page.url
             if current_url.lower().endswith(".pdf") or "pdf" in current_url.lower():
@@ -250,8 +250,8 @@ async def get_biorxiv_pdf_link(article_url: str) -> str:
                 logging.warning("playwright_stealth not installed; continuing without stealth")
 
             print(f"Navigating to: {article_url}")
-            await page.goto(article_url, wait_until="networkidle")
-            await page.wait_for_timeout(30000)
+            await page.goto(article_url, wait_until="load")
+            await page.wait_for_timeout(60000)
 
             current_url = page.url
             if current_url.lower().endswith(".pdf") or "pdf" in current_url.lower():
@@ -260,7 +260,7 @@ async def get_biorxiv_pdf_link(article_url: str) -> str:
             else:
                 pdf_href = None
                 try:
-                    await page.wait_for_selector("a.article-dl-pdf-link", timeout=30000)
+                    await page.wait_for_selector("a.article-dl-pdf-link", timeout=50000)
                     pdf_href = await page.locator("a.article-dl-pdf-link").get_attribute("href")
                 except Exception as e:
                     print(f"Could not find PDF link via class selector: {e}")

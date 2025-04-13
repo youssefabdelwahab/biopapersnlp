@@ -4,14 +4,14 @@ import requests
 from dotenv import load_dotenv
 load_dotenv()
 
-base_url = "http://127.0.0.1:5000/v1"
+base_url = os.getenv('url')
 api_key = os.getenv('OPENAI_API_KEY')
 
 class LLMAgent: 
 
     def __init__(self, 
                  model_name,
-                 base_url = "http://127.0.0.1:5000/v1",
+                 base_url = os.getenv('url'),
                  api_key=None):
 
         if api_key is None: 
