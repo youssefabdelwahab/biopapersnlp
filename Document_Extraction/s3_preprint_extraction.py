@@ -107,15 +107,7 @@ async def process_pdf(path: str):
         return []
     return paper_chunks
     
-    
-async def clean_chunk_text(loop, chunk: str) -> str:
-    """Clean a single text chunk through the LLM with semaphore throttling."""
-    async with llm_semaphore:
-        return await loop.run_in_executor(None, agent.one_turn, cleaning_prompt, chunk)
 
-async def get_title(loop, text: str) -> str:
-    async with llm_semaphore:
-        return await loop.run_in_executor(None, agent.one_turn, title_prompt, text)
 
 counter = 0
 counter_lock = asyncio.Lock()
@@ -181,7 +173,7 @@ async def extract_preprint_and_published_papers(extracted_q, unextracted_q, unkn
             await unknown_q.put(paper_dict)
             continue
         
-        print(f"Paper Title Found , moving on to extraction phase ")
+        print(f"Paper Title Found , {paper_title} ")
         preprint_info = get_article_info_from_title(paper_title)
         
         if preprint_info['doi'] is None:
@@ -204,10 +196,12 @@ async def extract_preprint_and_published_papers(extracted_q, unextracted_q, unkn
             await unknown_q.put(paper_dict)
             continue
         
+        print(f"Preprint DOI found: {preprint_info['doi']}, proceeding with extraction")
         preprint_doi = preprint_info.get("doi")
         preprint_paper_metadata = await retry_biorxiv(preprint_doi, preprint=True)
         preprint_coll = (preprint_paper_metadata or {}).get("collection", [])
         if not preprint_coll:
+            print(f"preprint info was not found on biorxiv")
             paper_dict.update({
                 "preprint_doi": None,
                 "published_doi":None,
@@ -224,6 +218,7 @@ async def extract_preprint_and_published_papers(extracted_q, unextracted_q, unkn
             })
             await unknown_q.put(paper_dict)
             continue
+        print("preprint info found on biorxiv")
         latest_preprint = preprint_coll[-1]
         published_doi = latest_preprint.get('published')
         
@@ -250,6 +245,7 @@ async def extract_preprint_and_published_papers(extracted_q, unextracted_q, unkn
         published_paper_metadata = await retry_biorxiv(published_doi, preprint=False)
         published_coll = (published_paper_metadata or {}).get("collection", [])
         if not published_coll:
+            print(f"published info was not found on biorxiv for {paper_title} storing preprint")
             paper_dict.update({
                 "preprint_doi": latest_preprint.get('doi'),
                 "published_doi":None,
@@ -266,6 +262,7 @@ async def extract_preprint_and_published_papers(extracted_q, unextracted_q, unkn
             })
             await unextracted_q.put(paper_dict)
             continue
+        print("published info found on biorxiv")
         latest_pub = published_coll[0]
         confirmed_published_doi = latest_pub.get('published_doi')
         published_link = f"https://doi.org/{confirmed_published_doi}"
@@ -278,7 +275,6 @@ async def extract_preprint_and_published_papers(extracted_q, unextracted_q, unkn
                 print("Successfully extracted published paper")
                 published_chunks = functions.chunk_text_by_char_limit(published_text, limit=5000)
             
-                # published_tasks = [clean_chunk_text(loop, chunk) for chunk in published_chunks]
                 
                 published_cleaned_chunks = await asyncio.gather(*(call_llm(cleaning_prompt, c) for c in published_chunks))
                 published_cleaned_text = " ".join(published_cleaned_chunks)
@@ -304,6 +300,7 @@ async def extract_preprint_and_published_papers(extracted_q, unextracted_q, unkn
                 async with counter_lock:
                     counter += 1
                 print(f"preprint and published extracted for {paper_title}")
+                print(f"Total papers extracted so far: {counter}")
 
                 if counter == 1000: 
                     break
