@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+*.env
+.env.*
+venv/
+.venv/
+*.sqlite3
+
+# Playwright
+playwright-report/
+*.log
+*.webm
+trace.zip
+
+# VSCode
+.vscode/
+
+# Jupyter
+.ipynb_checkpoints/**
+
+# Mac/Linux
+.DS_Store
+
+papers/**
+
+# Ignore archived papers directory
+archived_papers/
+
+# Ignore all Jupyter notebooks
+*.ipynb
+
+Document_Extraction/preprint_test.ipynb
+
+
+biopapers/
