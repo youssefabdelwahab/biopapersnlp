@@ -32,7 +32,7 @@ archived_papers/
 # Ignore all Jupyter notebooks
 *.ipynb
 
-Document_Extraction/preprint_test.ipynb
+Document_Extraction/preprint_test.ipynb/
 
 
 biopapers/
