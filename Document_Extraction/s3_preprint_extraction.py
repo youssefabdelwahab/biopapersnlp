@@ -52,21 +52,26 @@ cleaning_prompt = """
                         Return ONLY the cleaned and readable main body text from the input. DO NOT add any commentary, introduction, summary, or instructional text.
 """
 title_prompt = """
-        
+                You are given the introductory excerpt from a scientific paper.
 
-            You will receive a partial excerpt of a scientific paper.
+                Your sole task is to extract and return the **exact title** of the paper, using the rules below. You must try all strategies rigorously and thoroughly. Be exhaustive but precise. Do not return anything except the title string.
 
-            Your task is to extract and return only the title of the paper, using the following rules:
+                Extraction Rules (in order of priority):
 
-            - If the text contains a line that starts with 'Title:', return only the text that follows it on that line.
-            - If 'Title:' is not found, look for the very first non-empty line that appears before a line starting with
-            'Authors' or 'Affiliations'. That is likely the title. Return that line as the title.
-            - Do not reply with anything else except the title.
-            - If no such title can be found, return: Title not found
+                1. If any line starts with 'Title:', extract and return only the text that follows it on the same line.
+                2. If no 'Title:' line is found:
+                    - Identify the first **non-empty line** that appears **before** any line that begins with 'Authors' or 'Affiliations'.
+                    - That line is considered the title. Extract and return it exactly as it appears.
+                3. If none of the above methods succeed, return only:
+                    Title not found
 
-            Return only the exact title as a plain string. Do not add any labels, formatting, or explanation.
+                Additional Constraints:
+                - Return only the exact title text as a plain string.
+                - Do not include labels, explanations, or formatting.
+                - Do not guess or generate a title if it cannot be confidently extracted by the rules.
 
-            """
+                Be precise. Follow the rules strictly. Your answer must be either the extracted title or exactly: Title not found
+                """
 biorxiv_api = bioarxiv_class.bioarxiv_api()
 api_key = os.getenv("API_KEY")
 model_name = 'Llama-3-8B-Instruct-exl2'
@@ -100,7 +105,7 @@ async def process_pdf(path: str):
                     continue
                 if not page_text.strip():
                     continue
-                page_chunks = functions.chunk_text_by_char_limit(page_text, limit=5000)
+                page_chunks = functions.chunk_text_by_char_limit(page_text, limit=7500)
                 page_chunks_cleaned = await asyncio.gather(*(call_llm(cleaning_prompt, c) for c in page_chunks))
                 paper_chunks.append(" ".join(page_chunks_cleaned))
     except Exception:
@@ -127,6 +132,7 @@ async def extract_preprint_and_published_papers(extracted_q, unextracted_q, unkn
             "published_paper": None
                 }
         paper_dict = {
+            "preprint_pdf_name": paper,
             "preprint_doi": "",
             "published_doi": "",
             "published_journal": "",
@@ -157,6 +163,7 @@ async def extract_preprint_and_published_papers(extracted_q, unextracted_q, unkn
             print(f"Title not found for {paper_path}")
             #extract preprint and save it to unknown_preprints folder
             paper_dict.update({
+                "preprint_pdf_name": paper,
                 "preprint_doi": None,
                 "published_doi":None,
                 "published_journal": None,
@@ -180,6 +187,7 @@ async def extract_preprint_and_published_papers(extracted_q, unextracted_q, unkn
             print(f"Could not find preprint doi for {paper_title}")
             #save it to unknown_preprints folder
             paper_dict.update({
+                'preprint_pdf_name': paper,
                 "preprint_doi": None,
                 "published_doi":None,
                 "published_journal": None,
@@ -203,6 +211,7 @@ async def extract_preprint_and_published_papers(extracted_q, unextracted_q, unkn
         if not preprint_coll:
             print(f"preprint info was not found on biorxiv")
             paper_dict.update({
+                'preprint_pdf_name': paper,
                 "preprint_doi": None,
                 "published_doi":None,
                 "published_journal": None,
@@ -226,6 +235,7 @@ async def extract_preprint_and_published_papers(extracted_q, unextracted_q, unkn
             print("Preprint has not been published yet, storing preprint")
             #store its metadata information and save it to unextracted_papers
             paper_dict.update({
+                'preprint_pdf_name': paper,
                 "preprint_doi": latest_preprint.get('doi'),
                 "published_doi":None,
                 "published_journal": None,
@@ -247,6 +257,7 @@ async def extract_preprint_and_published_papers(extracted_q, unextracted_q, unkn
         if not published_coll:
             print(f"published info was not found on biorxiv for {paper_title} storing preprint")
             paper_dict.update({
+                'preprint_pdf_name': paper,
                 "preprint_doi": latest_preprint.get('doi'),
                 "published_doi":None,
                 "published_journal": None,
@@ -273,7 +284,7 @@ async def extract_preprint_and_published_papers(extracted_q, unextracted_q, unkn
             published_text = await functions.extract_text_from_pdf_via_browser(published_link)
             if published_text:
                 print("Successfully extracted published paper")
-                published_chunks = functions.chunk_text_by_char_limit(published_text, limit=5000)
+                published_chunks = functions.chunk_text_by_char_limit(published_text, limit=7500)
             
                 
                 published_cleaned_chunks = await asyncio.gather(*(call_llm(cleaning_prompt, c) for c in published_chunks))
@@ -282,6 +293,7 @@ async def extract_preprint_and_published_papers(extracted_q, unextracted_q, unkn
                     "published_paper" : published_cleaned_text
                 })
                 paper_dict.update({
+                'preprint_pdf_name': paper,
                 "preprint_doi": latest_pub.get('preprint_doi'),
                 "published_doi": latest_pub.get('published_doi'),
                 "published_journal": latest_pub.get('published_journal'),
@@ -312,6 +324,7 @@ async def extract_preprint_and_published_papers(extracted_q, unextracted_q, unkn
         if not success:
             print(f"Could not extract text from {published_link}, storing preprint only")
             paper_dict.update({
+                'preprint_pdf_name': paper,
                 "preprint_doi": latest_pub.get('preprint_doi'),
                 "published_doi": latest_pub.get('published_doi'),
                 "published_journal": latest_pub.get('published_journal'),
