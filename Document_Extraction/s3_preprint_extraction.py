@@ -20,6 +20,7 @@ from functions_and_classes import  functions
 from functions_and_classes import bioarxiv_class
 from functions_and_classes.paper_to_doi import get_article_info_from_title
 from LLM_Agent.llm_template import LLMAgent
+from functions_and_classes.pdf_resolver import PDFResolver
 load_dotenv()
 
 repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -112,7 +113,23 @@ async def process_pdf(path: str):
         return []
     return paper_chunks
     
+async def extract_text_with_pdf_resolver(doi: str, paper_id, selector_timeout:int) -> str: 
+    """
+        Resolve *doi* → PDF → text using the new async PDFResolver.
 
+    • Tries all resolver logic (Springer, OUP, Wiley, Playwright fallback…)
+    • Downloads the PDF URL it finds
+    • Extracts text with your existing `pdf_parser.extract_text_from_pdf_url`
+    • Returns *None* if nothing could be extracted
+    """
+    async with PDFResolver(selector_timeout= selector_timeout) as resolver: 
+        try:
+            pdf = await resolver.get_pdf(doi=doi, paper_id=paper_id)
+            return pdf
+        except resolver.CantDownload as exc: 
+            #print 
+            return {"url":exc.landing}
+    
 
 counter = 0
 counter_lock = asyncio.Lock()
@@ -275,54 +292,56 @@ async def extract_preprint_and_published_papers(extracted_q, unextracted_q, unkn
             continue
         print("published info found on biorxiv")
         latest_pub = published_coll[0]
-        confirmed_published_doi = latest_pub.get('published_doi')
-        published_link = f"https://doi.org/{confirmed_published_doi}"
-        
+        confirmed_published_doi = latest_pub.get('published_doi')        
         published_text = None 
-        success = False
         try:
-            published_text = await functions.extract_text_from_pdf_via_browser(published_link)
-            if published_text:
-                print("Successfully extracted published paper")
-                published_chunks = functions.chunk_text_by_char_limit(published_text, limit=7500)
-            
-                
-                published_cleaned_chunks = await asyncio.gather(*(call_llm(cleaning_prompt, c) for c in published_chunks))
-                published_cleaned_text = " ".join(published_cleaned_chunks)
-                research_text_bucket.update({
-                    "published_paper" : published_cleaned_text
-                })
-                paper_dict.update({
-                'preprint_pdf_name': paper,
-                "preprint_doi": latest_pub.get('preprint_doi'),
-                "published_doi": latest_pub.get('published_doi'),
-                "published_journal": latest_pub.get('published_journal'),
-                "preprint_title": paper_title,
-                "preprint_authors": latest_pub.get('preprint_authors'),
-                "preprint_category": latest_pub.get('preprint_category'),
-                "preprint_date": latest_pub.get('preprint_date'),
-                "published_date": latest_pub.get('published_date'),
-                "preprint_author_corresponding": latest_pub.get('preprint_author_corresponding'),
-                "preprint_author_corresponding_institution": latest_pub.get('preprint_author_corresponding_institution'),
-                "preprint_paper": research_text_bucket["preprint_paper"],
-                "published_paper": research_text_bucket["published_paper"]
-                })
-            
-                await extracted_q.put(paper_dict)
-                async with counter_lock:
-                    counter += 1
-                print(f"preprint and published extracted for {paper_title}")
-                print(f"Total papers extracted so far: {counter}")
-
-                if counter == 1000: 
-                    break
-                success = True
+            published_result = await extract_text_with_pdf_resolver(doi = confirmed_published_doi, paper_id= confirmed_published_doi, selector_timeout=20000 )
+            if isinstance(published_result, dict) and 'url' in published_result: 
+                #log failure 
+                published_text = None
+                url = published_result['url']
+            else: 
+                published_text = published_result
         except asyncio.TimeoutError as e:
             print("Async timeout fetching published PDF for %s: %s", paper, e)
         except Exception as e:
             print(f"Error extracting published paper: {e}")
-        if not success:
-            print(f"Could not extract text from {published_link}, storing preprint only")
+        if published_text:
+            print("Successfully extracted published paper")
+            published_chunks = functions.chunk_text_by_char_limit(published_text, limit=7500)
+        
+            
+            published_cleaned_chunks = await asyncio.gather(*(call_llm(cleaning_prompt, c) for c in published_chunks))
+            published_cleaned_text = " ".join(published_cleaned_chunks)
+            research_text_bucket.update({
+                "published_paper" : published_cleaned_text
+            })
+            paper_dict.update({
+            'preprint_pdf_name': paper,
+            "preprint_doi": latest_pub.get('preprint_doi'),
+            "published_doi": latest_pub.get('published_doi'),
+            "published_journal": latest_pub.get('published_journal'),
+            "preprint_title": paper_title,
+            "preprint_authors": latest_pub.get('preprint_authors'),
+            "preprint_category": latest_pub.get('preprint_category'),
+            "preprint_date": latest_pub.get('preprint_date'),
+            "published_date": latest_pub.get('published_date'),
+            "preprint_author_corresponding": latest_pub.get('preprint_author_corresponding'),
+            "preprint_author_corresponding_institution": latest_pub.get('preprint_author_corresponding_institution'),
+            "preprint_paper": research_text_bucket["preprint_paper"],
+            "published_paper": research_text_bucket["published_paper"]
+            })
+        
+            await extracted_q.put(paper_dict)
+            async with counter_lock:
+                counter += 1
+            print(f"preprint and published extracted for {paper_title}")
+            print(f"Total papers extracted so far: {counter}")
+
+            if counter == 1000: 
+                break
+        else:
+            print(f"Could not extract text from {confirmed_published_doi}, storing preprint only")
             paper_dict.update({
                 'preprint_pdf_name': paper,
                 "preprint_doi": latest_pub.get('preprint_doi'),
@@ -336,7 +355,8 @@ async def extract_preprint_and_published_papers(extracted_q, unextracted_q, unkn
                 "preprint_author_corresponding": latest_pub.get('preprint_author_corresponding'),
                 "preprint_author_corresponding_institution": latest_pub.get('preprint_author_corresponding_institution'),
                 "preprint_paper": research_text_bucket["preprint_paper"],
-                "published_paper": None
+                "published_paper": published_text, 
+                "url": url
                 })
             await unextracted_q.put(paper_dict)
             continue 
