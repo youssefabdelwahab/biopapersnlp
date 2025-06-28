@@ -21,6 +21,8 @@ from functions_and_classes import bioarxiv_class
 from functions_and_classes.paper_to_doi import get_article_info_from_title
 from LLM_Agent.llm_template import LLMAgent
 from functions_and_classes.pdf_resolver import PDFResolver
+import re
+from typing import Optional
 load_dotenv()
 
 repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -53,23 +55,37 @@ cleaning_prompt = """
                         Return ONLY the cleaned and readable main body text from the input. DO NOT add any commentary, introduction, summary, or instructional text.
 """
 title_prompt = """
-                You are given the introductory excerpt from a scientific paper.
+                You are given a part of the introductory excerpt from a scientific paper.
 
                 Your sole task is to extract and return the **exact title** of the paper, using the rules below. 
                 
-                You are an extraction bot.
+                
+                The title will be found in the first non empty line of the text
 
-                Task: from the text below, return **exactly** the paper title or the exact phrase:
-                Title not found
+                Task: from the text below, return **exactly** the paper title or **Title not found**
 
                 Rules (highest priority first)
-                1. If a line starts with `Title:` return the text after `Title:` on that same line.
-                2. Otherwise return the first non-empty line that appears **before** any line that starts with `Authors` or `Affiliations`.
+                1.return the first non-empty line that appears **before** any line that starts with `Authors` or `Affiliations`.
                 3. If nothing matches, return: Title not found
 
                 Output format (must follow **exactly**):
                 <plain title>           ← no quotes, no label, no markdown
                 """
+                
+title_patterns= re.compile(
+    r"""(?ix)                  # i = ignore-case, x = free-spacing
+    ^\s*                       # optional leading white-space
+    (?:                        # … followed by one of these phrases
+        title\s*:              |   #  Title:
+        the\s+title\s+is\s*:   |   #  The title is:
+        exact\s+title\s+of\s+the\s+paper\s+is\s*: |  #  Exact title of the paper is:
+        here\s+is\s+the\s+title\s*:                 #  Here is the title:
+    )
+    \s*                        # toss any white-space after the label
+    """,
+    re.UNICODE,
+)              
+                
 biorxiv_api = bioarxiv_class.bioarxiv_api()
 api_key = os.getenv("API_KEY")
 model_name = 'Llama-3-8B-Instruct-exl2'
@@ -139,7 +155,25 @@ def remove_newlines(text: str) -> str:
         """
         return text.replace("\n", "")
 
-    
+def clean_title(raw: str) -> Optional[str]:
+    """
+    Remove leading label phrases & any stray ':' or ';'.
+    Returns the cleaned title, or *None* if nothing is left.
+    """
+    if raw is None:
+        return None
+
+    # 1) strip the label if present
+    text = title_patterns.sub("", raw)
+
+    # 2) strip leading / trailing colons, semicolons & white-space
+    text = text.strip(" :;\n\t\r")
+
+    # 3) collapse internal runs of white-space to a single space
+    text = re.sub(r"\s+", " ", text).strip()
+
+    return text or None   # return None when only labels were present
+
 
 counter = 0
 counter_lock = asyncio.Lock()
@@ -187,8 +221,9 @@ async def extract_preprint_and_published_papers(extracted_q, unextracted_q, unkn
         intro_paragraph_cleaned = remove_newlines(intro_paragraph)
         
         paper_title  = await call_llm(title_prompt, intro_paragraph_cleaned)
+        paper_title_cleaned = clean_title(paper_title)
 
-        if paper_title == "Title not found":
+        if paper_title_cleaned == "Title not found":
             print(f"Title not found for {paper_path}")
             #extract preprint and save it to unknown_preprints folder
             paper_dict.update({
@@ -196,7 +231,7 @@ async def extract_preprint_and_published_papers(extracted_q, unextracted_q, unkn
                 "preprint_doi": None,
                 "published_doi":None,
                 "published_journal": None,
-                "preprint_title": paper_title,
+                "preprint_title": paper_title_cleaned,
                 "preprint_authors": None,
                 "preprint_category": None,
                 "preprint_date": None,
@@ -209,18 +244,18 @@ async def extract_preprint_and_published_papers(extracted_q, unextracted_q, unkn
             await unknown_q.put(paper_dict)
             continue
         
-        print(f"Paper Title Found , {paper_title} ")
-        preprint_info = get_article_info_from_title(paper_title)
+        print(f"Paper Title Found , {paper_title_cleaned} ")
+        preprint_info = get_article_info_from_title(paper_title_cleaned)
         
         if preprint_info is None or preprint_info.get("doi") is None:
-            print(f"Could not find preprint doi for {paper_title}")
+            print(f"Could not find preprint doi for {paper_title_cleaned}")
             #save it to unknown_preprints folder
             paper_dict.update({
                 'preprint_pdf_name': paper,
                 "preprint_doi": None,
                 "published_doi":None,
                 "published_journal": None,
-                "preprint_title": paper_title,
+                "preprint_title": paper_title_cleaned,
                 "preprint_authors": None,
                 "preprint_category": None,
                 "preprint_date": None,
@@ -244,7 +279,7 @@ async def extract_preprint_and_published_papers(extracted_q, unextracted_q, unkn
                 "preprint_doi": None,
                 "published_doi":None,
                 "published_journal": None,
-                "preprint_title": paper_title,
+                "preprint_title": paper_title_cleaned,
                 "preprint_authors": None,
                 "preprint_category": None,
                 "preprint_date": None,
@@ -268,7 +303,7 @@ async def extract_preprint_and_published_papers(extracted_q, unextracted_q, unkn
                 "preprint_doi": latest_preprint.get('doi'),
                 "published_doi":None,
                 "published_journal": None,
-                "preprint_title": paper_title,
+                "preprint_title": paper_title_cleaned,
                 "preprint_authors": latest_preprint.get('authors'),
                 "preprint_category": latest_preprint.get('category'),
                 "preprint_date": latest_preprint.get('date'),
@@ -284,13 +319,13 @@ async def extract_preprint_and_published_papers(extracted_q, unextracted_q, unkn
         published_paper_metadata = await retry_biorxiv(published_doi, preprint=False)
         published_coll = (published_paper_metadata or {}).get("collection", [])
         if not published_coll:
-            print(f"published info was not found on biorxiv for {paper_title} storing preprint")
+            print(f"published info was not found on biorxiv for {paper_title_cleaned} storing preprint")
             paper_dict.update({
                 'preprint_pdf_name': paper,
                 "preprint_doi": latest_preprint.get('doi'),
                 "published_doi":None,
                 "published_journal": None,
-                "preprint_title": paper_title,
+                "preprint_title": paper_title_cleaned,
                 "preprint_authors": latest_preprint.get('authors'),
                 "preprint_category": latest_preprint.get('category'),
                 "preprint_date": latest_preprint.get('date'),
@@ -334,7 +369,7 @@ async def extract_preprint_and_published_papers(extracted_q, unextracted_q, unkn
             "preprint_doi": latest_pub.get('preprint_doi'),
             "published_doi": latest_pub.get('published_doi'),
             "published_journal": latest_pub.get('published_journal'),
-            "preprint_title": paper_title,
+            "preprint_title": paper_title_cleaned,
             "preprint_authors": latest_pub.get('preprint_authors'),
             "preprint_category": latest_pub.get('preprint_category'),
             "preprint_date": latest_pub.get('preprint_date'),
@@ -348,7 +383,7 @@ async def extract_preprint_and_published_papers(extracted_q, unextracted_q, unkn
             await extracted_q.put(paper_dict)
             async with counter_lock:
                 counter += 1
-            print(f"preprint and published extracted for {paper_title}")
+            print(f"preprint and published extracted for {paper_title_cleaned}")
             print(f"Total papers extracted so far: {counter}")
 
             if counter == 1000: 
@@ -360,7 +395,7 @@ async def extract_preprint_and_published_papers(extracted_q, unextracted_q, unkn
                 "preprint_doi": latest_pub.get('preprint_doi'),
                 "published_doi": latest_pub.get('published_doi'),
                 "published_journal": latest_pub.get('published_journal'),
-                "preprint_title": paper_title,
+                "preprint_title": paper_title_cleaned,
                 "preprint_authors": latest_pub.get('preprint_authors'),
                 "preprint_category": latest_pub.get('preprint_category'),
                 "preprint_date": latest_pub.get('preprint_date'),
