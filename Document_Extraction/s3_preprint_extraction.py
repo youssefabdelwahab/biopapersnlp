@@ -55,23 +55,20 @@ cleaning_prompt = """
 title_prompt = """
                 You are given the introductory excerpt from a scientific paper.
 
-                Your sole task is to extract and return the **exact title** of the paper, using the rules below. You must try all strategies rigorously and thoroughly. Be exhaustive but precise. Do not return anything except the title string.
+                Your sole task is to extract and return the **exact title** of the paper, using the rules below. 
+                
+                You are an extraction bot.
 
-                Extraction Rules (in order of priority):
+                Task: from the text below, return **exactly** the paper title or the exact phrase:
+                Title not found
 
-                1. If any line starts with 'Title:', extract and return only the text that follows it on the same line.
-                2. If no 'Title:' line is found:
-                    - Identify the first **non-empty line** that appears **before** any line that begins with 'Authors' or 'Affiliations'.
-                    - That line is considered the title. Extract and return it exactly as it appears.
-                3. If none of the above methods succeed, return only:
-                    Title not found
+                Rules (highest priority first)
+                1. If a line starts with `Title:` return the text after `Title:` on that same line.
+                2. Otherwise return the first non-empty line that appears **before** any line that starts with `Authors` or `Affiliations`.
+                3. If nothing matches, return: Title not found
 
-                Additional Constraints:
-                - Return only the exact title text as a plain string.
-                - Do not include labels, explanations, or formatting.
-                - Do not guess or generate a title if it cannot be confidently extracted by the rules.
-
-                Be precise. Follow the rules strictly. Your answer must be either the extracted title or exactly: Title not found
+                Output format (must follow **exactly**):
+                <plain title>           ← no quotes, no label, no markdown
                 """
 biorxiv_api = bioarxiv_class.bioarxiv_api()
 api_key = os.getenv("API_KEY")
@@ -129,6 +126,19 @@ async def extract_text_with_pdf_resolver(doi: str, paper_id, selector_timeout:in
         except resolver.CantDownload as exc: 
             #print 
             return {"url":exc.landing}
+
+def remove_newlines(text: str) -> str:
+        """
+        Removes all newline characters from the input string.
+
+        Args:
+            text (str): The input string.
+
+        Returns:
+            str: The string with all '\n' characters removed.
+        """
+        return text.replace("\n", "")
+
     
 
 counter = 0
@@ -162,6 +172,7 @@ async def extract_preprint_and_published_papers(extracted_q, unextracted_q, unkn
             "preprint_author_corresponding_institution": "",
             "preprint_paper": "",
             "published_paper": "",
+            'url': None
         }
         
         
@@ -173,8 +184,9 @@ async def extract_preprint_and_published_papers(extracted_q, unextracted_q, unkn
             "preprint_paper": preprint_cleaned_text
         })
         intro_paragraph = str(preprint_chunks[0])
+        intro_paragraph_cleaned = remove_newlines(intro_paragraph)
         
-        paper_title  = await call_llm(title_prompt, intro_paragraph)
+        paper_title  = await call_llm(title_prompt, intro_paragraph_cleaned)
 
         if paper_title == "Title not found":
             print(f"Title not found for {paper_path}")
@@ -200,7 +212,7 @@ async def extract_preprint_and_published_papers(extracted_q, unextracted_q, unkn
         print(f"Paper Title Found , {paper_title} ")
         preprint_info = get_article_info_from_title(paper_title)
         
-        if preprint_info['doi'] is None:
+        if preprint_info is None or preprint_info.get("doi") is None:
             print(f"Could not find preprint doi for {paper_title}")
             #save it to unknown_preprints folder
             paper_dict.update({
@@ -293,9 +305,10 @@ async def extract_preprint_and_published_papers(extracted_q, unextracted_q, unkn
         print("published info found on biorxiv")
         latest_pub = published_coll[0]
         confirmed_published_doi = latest_pub.get('published_doi')        
-        published_text = None 
+        published_text = None
+        url = None
         try:
-            published_result = await extract_text_with_pdf_resolver(doi = confirmed_published_doi, paper_id= confirmed_published_doi, selector_timeout=20000 )
+            published_result = await extract_text_with_pdf_resolver(doi = confirmed_published_doi, paper_id= confirmed_published_doi, selector_timeout=40_000 )
             if isinstance(published_result, dict) and 'url' in published_result: 
                 #log failure 
                 published_text = None
@@ -355,7 +368,7 @@ async def extract_preprint_and_published_papers(extracted_q, unextracted_q, unkn
                 "preprint_author_corresponding": latest_pub.get('preprint_author_corresponding'),
                 "preprint_author_corresponding_institution": latest_pub.get('preprint_author_corresponding_institution'),
                 "preprint_paper": research_text_bucket["preprint_paper"],
-                "published_paper": published_text, 
+                "published_paper": None, 
                 "url": url
                 })
             await unextracted_q.put(paper_dict)
