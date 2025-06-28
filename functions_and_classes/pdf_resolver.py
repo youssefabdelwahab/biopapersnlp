@@ -29,7 +29,7 @@ from typing import Optional , AsyncIterator , List
 import urllib.parse
 import requests
 from dotenv import load_dotenv
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright , Playwright , Browser , TimeoutError as PWTimeoutError, Page
 import asyncio , functools
 import os
 from typing import Optional
@@ -42,7 +42,7 @@ import logging
 import pdfplumber , pytesseract
 from pdf2image import convert_from_bytes
 import random
-from playwright.async_api import BrowserContext
+from playwright.async_api import BrowserContext 
 
 load_dotenv()
 
@@ -95,10 +95,30 @@ def extract_pdf(pdf_data):
 def drop_www(host:str) -> str: 
     return host[4:] if host.startswith("www.") else host
 
+login_selectors = {
+            "user":   'input[name="user"], input[name="username"], #username',
+            "pass":   'input[name="pass"], input[name="password"], #password',
+            "submit": 'input[type="submit"], button[type="submit"]'
 
+        }
+JOURNAL_PDF_SELECTORS = {
+        "bmj.com": 'a[title="Download this article as a PDF"]',
+        "thelancet.com": 'a.download-pdf-link',
+        "nejm.org": 'a[href*="pdf"]',
+        "sciencedirect.com": 'a.pdf-download',
+        "jamanetwork.com": 'a[href*="/pdf"]',
+        "nature.com": 'a[data-track-action="download pdf"]',
+        "springer.com": 'a[href$=".pdf"]',
+        "oup.com": 'a[href$=".pdf"]',
+        "frontiersin.org": 'a[href*="/pdf"]',
+        "tandfonline.com": 'a[href*="/pdf"]',
+        "sagepub.com": 'a.article-tools-download',
+        "karger.com": 'a[href$=".pdf"]',
+        # Add more as needed...
+    }
 class PDFResolver:
-    playwright: "playwright.async_api.Playwright" | None = None
-    browser :"playwright.async_api.Browser" | None = None
+    playwright: Playwright | None = None
+    browser : Browser| None = None
     lock: asyncio.Lock = asyncio.Lock()
     def __init__(self, *, selector_timeout: int  , client: Optional[AsyncClient] = None):
         self._client = client
@@ -236,67 +256,7 @@ class PDFResolver:
             """
         )
         return context
-
-    async def get_pdf(self, doi, paper_id ) -> str:
-        print(f"Attempting to resolve pdf of paper_id: {paper_id}")
-        client = self._client_required()
-        if doi: 
-            landing = str((await client.get(f"https://doi.org/{doi}")).url)
-        else:
-            return self.MissingIdentifier()
-        print(f"Attempting to resolve pdf from : {landing}")
-
-        if self._SPRINGER_HOST in landing:
-            for springer_url in self._springer_candidates(landing, doi):
-                try: 
-                    springer_url = await self.try_pdf_url(springer_url)
-                except Exception as e:
-                    continue
-                if springer_url: 
-                    return springer_url
-                # if await self._is_pdf(url):
-                #     return url
-
-        if self._HINDAWI_DOWNLOAD_RE.match(landing) or self._HINDAWI_LANDING_RE.match(landing):
-            for hindawi_paper in (landing, f"https://doi.org/{doi}"):
-                if hindawi_paper:
-                    continue 
-                return hindawi_paper
-                # if await self._is_pdf(url):
-                #     return url
-
-        if self._F1000_HOST_RE.match(landing):
-            f100_pdf = await self._f1000_pdf(landing, doi)
-            if f100_pdf: 
-                return f100_pdf
-            # if api_pdf and await self._is_pdf(api_pdf):
-            #     return api_pdf
-
-        if self._OUP_HOST_RE.match(landing):
-            oup_pdf = await self._oup_pdf(landing)
-            if oup_pdf:
-                return oup_pdf
-            
-        if "onlinelibrary.wiley.com" in landing:
-            wiley_pdf = await self._wiley_pdf(landing, doi)
-            if wiley_pdf:
-                return wiley_pdf
-        
-        html = (await client.get(landing)).text
-        anchor = self._extract_anchor_pdf_score(html, landing)
-        if anchor:
-            return anchor
-
-        if doi and (cross := self._crossref_fallback(doi)):
-            return cross
-        
-        browser_pdf = await self.fetch_pdf_with_browser(doi , landing)
-        if browser_pdf:
-            return browser_pdf
-        
-
-        raise self.CantDownload(doi , landing)
-
+    
     def _springer_candidates(self, landing: str, doi: str) -> List[str]:
         base = f"https://{self._SPRINGER_HOST}"
         candidates = [f"{base}/content/pdf/{doi}.pdf"]
@@ -322,7 +282,7 @@ class PDFResolver:
         try: 
             url_response = await self.try_pdf_url(f100_url)
         except Exception as e: 
-            if url_response is not None: 
+            if url_response: 
                 return url_response 
         return None
 
@@ -333,14 +293,13 @@ class PDFResolver:
         try: 
             meta_response = await self.try_pdf_http(oup_meta)
         except Exception as e: 
-            if meta_response is not None: 
+            if meta_response: 
                 return meta_response 
-       
         oup_anchor = self._extract_anchor_pdf_score(html, landing)
         try: 
             anchor_response = await self.try_pdf_url(oup_anchor)
         except Exception as e: 
-            if anchor_response is not None: 
+            if anchor_response: 
                 return anchor_response
         return None
 
@@ -352,27 +311,18 @@ class PDFResolver:
         try: 
             url_response = await self.try_pdf_http(api_url)
         except Exception as e: 
-            if url_response is not None: 
+            if url_response: 
                 return url_response 
-        
-        # r = await client.get(
-        #     api_url,
-        #     headers= {"Authorization": f"Bearer {self.wiley_token}"})
-        # print(f"[Wiley] API status: {r.status_code}, content-type: {r.headers.get('content-type')}")
-        # print(f"[Wiley] Token present? {'yes' if self.wiley_token else 'no'}")
-        
-        # if r.status_code == 200 and r.headers.get("content-type", "").startswith("application/pdf"):
-        #     return api_url
         
         #pdfdirect 
         
         pdf_url = f"https://onlinelibrary.wiley.com/doi/pdfdirect/{doi}"
         r2 = await client.get(pdf_url)
         try:
-            response = await self.try_pdf_url(r2)
+            url_response = await self.try_pdf_url(r2)
         except Exception as e: 
-            if not response: 
-                return r2 
+            if url_response: 
+                return url_response
         #htmlparse 
         
         html = (await client.get(landing)).text
@@ -432,8 +382,6 @@ class PDFResolver:
         except Exception as e: 
             if url_response: 
                 return r 
-        # if r.status_code == 200 and r.headers.get("content-type", "").startswith("application/pdf"):
-        #     return pdf_url
         
         html = (await client.get(landing)).text
         if (meta:= self._extract_meta_pdf(html)):
@@ -480,105 +428,6 @@ class PDFResolver:
                 return resolved_karger_link 
         return None
     
-    # async def _is_pdf(self, url: str) -> bool:
-    #     client = self._client_required()
-    #     try:
-    #         r = await client.head(url)
-    #         if r.status_code in (403, 405):
-    #             r = await client.get(url, headers={"Range": "bytes=0-0"})
-    #         return r.status_code == 200 and r.headers.get("content-type", "").startswith("application/pdf")
-    #     except Exception:
-    #         return False
-
-    @staticmethod
-    def _extract_meta_pdf(html: str) -> Optional[str]:
-        tag = BeautifulSoup(html, "html.parser").find("meta", attrs={"name": "citation_pdf_url"})
-        return tag["content"].strip() if tag and tag.get("content") else None
-
-    
-    def _extract_anchor_pdf_score(self, html: str, base_url: str) -> Optional[str]:
-        soup = BeautifulSoup(html, "html.parser")
-        join = lambda h: urllib.parse.urljoin(base_url, h)
-        best = None
-
-        for a in soup.find_all("a", href=True):
-            href = a["href"].strip()
-            lower = href.lower()
-            full_url = join(href)
-
-            text = a.get_text(" ").lower()
-            cls = " ".join(a.get("class", [])).lower()
-            ident = a.get("id", "").lower()
-            title = a.get("title", "").lower()
-            aria = a.get("aria-label", "").lower()
-
-            score = 0
-            if lower.endswith(".pdf"):
-                score += 3
-            if "/article-pdf/" in lower or "/advance-article-pdf/" in lower:
-                score += 2
-            if "pdf" in text:
-                score += 2
-            if re.search(self._ANCHOR_HINT_RE, cls) or re.search(self._ANCHOR_HINT_RE, ident):
-                score += 1
-            if "full text" in text or "read article" in text:
-                score += 1
-            if "pdf" in title or "pdf" in aria:
-                score += 1
-
-            if score >= 3:  # only consider fairly confident ones
-                return full_url
-            elif not best and score > 0:
-                best = full_url
-        return best
-            
-    @staticmethod
-    def _crossref_fallback(doi: str) -> Optional[str]:
-        try:
-            r = requests.get(f"https://api.crossref.org/works/{doi}", timeout=15)
-            r.raise_for_status()
-            data = r.json()
-        except Exception:
-            return None
-        links = data.get("message", {}).get("link", [])
-        best = None
-        for link in links:
-            ct = link.get("content-type")
-            url = link.get("URL")
-            if ct == "text/html":
-                return url
-            if ct == "application/pdf" and best is None:
-                best = url
-            if url and url.endswith(".pdf") and best is None:
-                best = url
-        return best 
-    
-    async def try_pdf_http(self,url:str):
-        """
-        Download *url* with httpx, verify it is a PDF (%PDF magic),
-        then return extracted text (or None on failure).
-        """
-       
-        client = self._client_required()
-        try:
-            resp = await client.get(url, timeout=15)
-        except Exception as exc:
-            print(f"[resolver] httpx GET failed: {exc}")
-            return None
-
-        if resp.status_code != 200:
-            return None
-
-        ctype = resp.headers.get("content-type", "").lower()
-        if "pdf" not in ctype and not url.lower().endswith(".pdf"):
-            return None
-
-        raw = resp.content
-        if raw[:4] != b"%PDF":
-            return None
-        loop = asyncio.get_event_loop()
-        text = await loop.run_in_executor(None, functools.partial(extract_pdf, raw))
-        return text or None
     
     async def try_pdf_url(self,
         url: str,
@@ -618,41 +467,189 @@ class PDFResolver:
 
         # Confirm first bytes contain %PDF-magic
         raw = await resp.body()
-        if raw[:4] != b"%PDF":
+        if not raw:
             return None
+        print('Successfully Extracted PDF from URL:', url)
         loop = asyncio.get_running_loop()
         text = await loop.run_in_executor(None, functools.partial(extract_pdf, raw))
-        return text or None
-
+        if text:
+            return text or None
     
-    async def fetch_pdf_with_browser(self , doi, landing) -> Optional[str]:
-        EZPROXY_PREFIX = "https://ezproxy.lib.ucalgary.ca/login?url="
-        JOURNAL_PDF_SELECTORS = {
-        "bmj.com": 'a[title="Download this article as a PDF"]',
-        "thelancet.com": 'a.download-pdf-link',
-        "nejm.org": 'a[href*="pdf"]',
-        "sciencedirect.com": 'a.pdf-download',
-        "jamanetwork.com": 'a[href*="/pdf"]',
-        "nature.com": 'a[data-track-action="download pdf"]',
-        "springer.com": 'a[href$=".pdf"]',
-        "oup.com": 'a[href$=".pdf"]',
-        "frontiersin.org": 'a.article-pdf-download',
-        "tandfonline.com": 'a[href*="/pdf"]',
-        "sagepub.com": 'a.article-tools-download',
-        "karger.com": 'a[href$=".pdf"]',
-        # Add more as needed...
-    }
-#         USER_AGENTS = [
-#     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-#     "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
-#     "Mozilla/5.0 (X11; Linux x86_64) Gecko/20100101 Firefox/125.0",
-# ]
+    
+    async def try_pdf_http(self,url:str):
+        """
+        Download *url* with httpx, verify it is a PDF (%PDF magic),
+        then return extracted text (or None on failure).
+        """
         client = self._client_required()
-        if doi:
-            landing_url = str((await client.get(f"https://doi.org/{doi}")).url)
-        else:
-            landing_url = str(landing)
-        proxied_url = EZPROXY_PREFIX + quote(landing_url, safe="")
+        try:
+            resp = await client.get(url, timeout=15)
+        except Exception as exc:
+            print(f"[resolver] httpx GET failed: {exc}")
+            return None
+
+        if resp.status_code != 200:
+            return None
+
+        ctype = resp.headers.get("content-type", "").lower()
+        if "pdf" not in ctype and not url.lower().endswith(".pdf"):
+            return None
+
+        raw = resp.content
+        if not raw:
+            return None
+        print('Successfully downloaded PDF from URL:', url)
+        loop = asyncio.get_event_loop()
+        text = await loop.run_in_executor(None, functools.partial(extract_pdf, raw))
+        if text: 
+            return text or None
+    
+    def _extract_anchor_pdf_score(self, html: str, base_url: str) -> Optional[str]:
+        soup = BeautifulSoup(html, "html.parser")
+        join = lambda h: urllib.parse.urljoin(base_url, h)
+        best = None
+
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            lower = href.lower()
+            full_url = join(href)
+
+            text = a.get_text(" ").lower()
+            cls = " ".join(a.get("class", [])).lower()
+            ident = a.get("id", "").lower()
+            title = a.get("title", "").lower()
+            aria = a.get("aria-label", "").lower()
+
+            score = 0
+            if lower.endswith(".pdf"):
+                score += 3
+            if "/article-pdf/" in lower or "/advance-article-pdf/" in lower:
+                score += 2
+            if "pdf" in text:
+                score += 2
+            if re.search(self._ANCHOR_HINT_RE, cls) or re.search(self._ANCHOR_HINT_RE, ident):
+                score += 1
+            if "full text" in text or "read article" in text:
+                score += 1
+            if "pdf" in title or "pdf" in aria:
+                score += 1
+
+            if score >= 3:  # only consider fairly confident ones
+                return full_url
+            elif not best and score > 0:
+                best = full_url
+        return best
+    
+    async def find_via_selector(self,domain: str, page: Page) -> str | None:
+        selector = JOURNAL_PDF_SELECTORS.get(domain)
+        if not selector:
+            return None                # nothing to try
+
+        try:
+            await page.wait_for_selector(selector, timeout=self.selector_timeout)
+        # take only the first match to avoid strict-mode failure
+            href   = await page.locator(selector).first.get_attribute("href")
+            if not href:
+                return None
+
+            resolved = urljoin(page.url, href)
+            text     = await self.try_pdf_url(resolved)
+            return text                 # None when not a PDF / could not extract
+        except PWTimeoutError:
+            return None
+        
+    async def find_pdf_button(self,page: Page) -> str | None:
+        try:
+            href_btn= await page.get_by_role("link", name="PDF").get_attribute("href")
+        except TimeoutError: 
+            return None
+        if not href_btn:
+            return None                     # no PDF button found
+        try:
+            resolved_href = urljoin(page.url, href_btn)
+            href_response = await self.try_pdf_url(resolved_href)
+            if href_response: 
+                return href_response
+        except TimeoutError:
+            return None
+    
+    async def find_via_anchor(self,page: Page) -> str | None:
+        html = await page.content()
+        soup = BeautifulSoup(html, "html.parser")
+        for a in soup.find_all("a", href=True):
+                href = a["href"].strip()
+                text = a.get_text(" ").lower()
+                cls = " ".join(a.get("class", [])).lower()
+                id_ = a.get("id", "").lower()
+                title = a.get("title", "").lower()
+                aria = a.get("aria-label", "").lower()
+                
+                looks_like_pdf = (
+                    href.lower().endswith(".pdf") or
+                    self._ANCHOR_HINT_RE.search(text) or
+                    self._ANCHOR_HINT_RE.search(href) or
+                    self._ANCHOR_HINT_RE.search(cls) or
+                    self._ANCHOR_HINT_RE.search(id_) or
+                    self._ANCHOR_HINT_RE.search(title) or
+                    self._ANCHOR_HINT_RE.search(aria)
+                )
+                
+                if not looks_like_pdf:
+                    continue
+                
+                anchor_link = urljoin(page.url, href)
+                try:
+                    anchor_response = await self.try_pdf_url(anchor_link)
+                    if anchor_response: 
+                        return anchor_response
+                except Exception as e:
+                    continue 
+                        #log
+        return None
+                    
+    async def find_via_redirect(self, page: Page) -> str | None:
+        current_url = page.url
+        if not  current_url.lower().endswith(".pdf") or "pdf" in current_url.lower():
+            return None
+        try:
+            redirect_response = await self.try_pdf_url(current_url)
+            if redirect_response: 
+                return redirect_response
+        except Exception as e: 
+                #log 
+            return None
+            
+    async def try_browser_strategies(self, domain:str,page: Page) -> str | None:
+        """
+        Run the **four** browser strategies in order.
+        Return extracted text or *None* when everything fails.
+        """
+        
+        strategies = [
+            self.find_via_selector,
+            self.find_via_redirect,
+            self.find_pdf_button,
+            self.find_via_anchor
+        ]
+        for fn in strategies:
+            try:
+                text = await fn(domain, page) if fn is self.find_via_selector else await fn(page)
+            except Exception:
+                continue
+            if text:                # one of the strategies succeeded
+                return text  
+        # All four strategies failed
+        print("All browser methods failed to extract PDF.")
+        return None
+
+    async def fetch_pdf_with_browser(self, landing) -> Optional[str]:
+    
+        client = self._client_required()
+        # if doi:
+        #     landing_url = str((await client.get(f"https://doi.org/{doi}")).url)
+        # else:
+        #     landing_url = str(landing)
+        landing_url = landing
         domain = drop_www(urlparse(landing_url).netloc.lower())
 
         username = os.getenv("uni_username")
@@ -661,117 +658,137 @@ class PDFResolver:
             raise RuntimeError("Missing EZProxy credentials.")
 
         context = await self.context_required()
-        async with context.new_page() as page:
+        async with await  context.new_page() as page:
             try:
                 await stealth_async(page)
             except ImportError:
                 logging.warning("playwright_stealth not installed; continuing without stealth")
 
-            #log navigation to url
-
-            # EZProxy login page
-            await page.goto(proxied_url, wait_until='networkidle')
-            if "login" in page.url.lower():
-                await page.goto(proxied_url)
-                await page.fill('input[name="user"]', username)
-                await page.fill('input[name="pass"]', password)
-                await page.click('input[type="submit"]')
-                await page.wait_for_load_state("networkidle")
-
-            # Journal-specific selector
-            selector = JOURNAL_PDF_SELECTORS.get(domain)
-            if selector:
-
-                await page.wait_for_selector(selector, timeout=self.selector_timeout)
-                pdf_link = await page.locator(selector).get_attribute("href")
-                if pdf_link:
-                    resolved_link = urljoin(page.url, pdf_link)
-                    try:
-                        url_response = await self.try_pdf_url(resolved_link)
-                    except Exception as e:
-                        if url_response: 
-                            return url_response
-                        # resolved_link = urljoin(page.url, pdf_link)
-                        # response = await context.request.get(resolved_link)
-                        # if response.status == 200 and "pdf" in resolved_link.lower():
-                        #     #log 
-                        #     content = await response.body()
-                        #     text = extract_pdf(content)
-                        #     if text: 
-                        #         return text
-                                
+            await page.goto(landing_url, wait_until='networkidle')
                 
-                    #log
-                # fallback to anchor hint matching
-                
-            #check for redirects that land on pdf 
-            current_url = page.url
-            if current_url.lower().endswith(".pdf") or "pdf" in current_url.lower():
-                #Log on a pdf page 
-                try:
-                    redirect_response = await self.try_pdf_url(current_url)
-                    # response = await context.request.get(current_url)
-                    # if response.status == 200 and "pdf" in response.headers.get("content-type", "").lower():
-                    #     print("PDF detected via URL.")
-                    #     content = await response.body()
-                    #     text = extract_pdf(content)
-                    #     if text: return text
-                except Exception as e: 
-                    #log 
-                    if redirect_response: 
-                        return redirect_response
-            #log
-            #check for explicit pdf button
-            
-            pdf_href = await page.get_by_role("link", name="PDF").get_attribute("href")
-            if pdf_href:
-                resolved_link = urljoin(page.url, pdf_href)
-                try:
-                    href_response = await self.try_pdf_url(resolved_link)
+            text = await self.try_browser_strategies(domain,page)
+            if text:
+                return text
+            print("All browser methods failed to extract PDF.")
+
+            return None
+        
+    @staticmethod
+    def _extract_meta_pdf(html: str) -> Optional[str]:
+        tag = BeautifulSoup(html, "html.parser").find("meta", attrs={"name": "citation_pdf_url"})
+        return tag["content"].strip() if tag and tag.get("content") else None
+    
+    @staticmethod
+    def _crossref_fallback(doi: str) -> Optional[str]:
+        try:
+            r = requests.get(f"https://api.crossref.org/works/{doi}", timeout=15)
+            r.raise_for_status()
+            data = r.json()
+        except Exception:
+            return None
+        links = data.get("message", {}).get("link", [])
+        best = None
+        for link in links:
+            ct = link.get("content-type")
+            url = link.get("URL")
+            if ct == "text/html":
+                return url
+            if ct == "application/pdf" and best is None:
+                best = url
+            if url and url.endswith(".pdf") and best is None:
+                best = url
+        return best 
+
+    
+    
+    async def get_pdf(self, doi, paper_id ) -> str:
+        print(f"Attempting to resolve pdf of paper_id: {paper_id}")
+        client = self._client_required()
+        if doi: 
+            landing = str((await client.get(f"https://doi.org/{doi}")).url)
+        else:
+            return self.MissingIdentifier()
+        print(f"Attempting to resolve pdf from : {landing}")
+
+        if self._SPRINGER_HOST in landing:
+            print("Trying with Springer landing page.")
+            for springer_url in self._springer_candidates(landing, doi):
+                try: 
+                    springer_url = await self.try_pdf_url(springer_url)
                 except Exception as e:
-                    #log 
-                    if href_response: 
-                        return href_response
-                # response = await context.request.get(resolved_link)
-                # if response.status == 200 and "pdf" in response.headers.get("content-type", "").lower():
-                #     print("PDF extracted from PDF button.")
-                #     content = await response.body()
-                #     text = extract_pdf(content)
-                #     if text: return text
+                    continue
+                if springer_url:
+                    print("Extracted PDF from Springer landing page.")
+
+                    return springer_url
+
+        if self._HINDAWI_DOWNLOAD_RE.match(landing) or self._HINDAWI_LANDING_RE.match(landing):
+            print("Trying with Hindawi landing page.")
+            for hindawi_paper in (landing, f"https://doi.org/{doi}"):
+                try:
+                    hindawi_url = await self.try_pdf_url(hindawi_paper)
+                except Exception as e:
+                    continue
+                if hindawi_url:
+                    print("Extracting PDF from Hindawi landing page.")
+                    return hindawi_url
+
+        if self._F1000_HOST_RE.match(landing):
+            print("Trying with F1000 landing page.")
+            f100_pdf = await self._f1000_pdf(landing, doi)
+            if f100_pdf:
+                print("Extracted PDF from F1000 landing page.")
+                return f100_pdf
+
+        if self._OUP_HOST_RE.match(landing):
+            print("Trying with OUP landing page.")
+            oup_pdf = await self._oup_pdf(landing)
+            if oup_pdf:
+                print("Extracted PDF from OUP landing page.")
+                return oup_pdf
+        
+        
+        if "onlinelibrary.wiley.com" in landing:
+            print("Trying with Wiley landing page.")
+            wiley_pdf = await self._wiley_pdf(landing, doi)
+            if wiley_pdf:
+                print("Extracted PDF from Wiley landing page.")
+                return wiley_pdf
             
-            #log use of hueristic anchor match
-            # Fallback using _ANCHOR_HINT_RE
-            html = await page.content()
-            soup = BeautifulSoup(html, "html.parser")
-            for a in soup.find_all("a", href=True):
-                href = a["href"].strip()
-                text = a.get_text(" ").lower()
-                cls = " ".join(a.get("class", [])).lower()
-                id_ = a.get("id", "").lower()
-                title = a.get("title", "").lower()
-                aria = a.get("aria-label", "").lower()
+        html = (await client.get(landing)).text
+        anchor = self._extract_anchor_pdf_score(html, landing)
+        if anchor:
+            print("Trying with anchor hint matching.")
 
-                if (
-                    href.lower().endswith(".pdf") or
-                    self._ANCHOR_HINT_RE.search(text) or
-                    self._ANCHOR_HINT_RE.search(href) or
-                    self._ANCHOR_HINT_RE.search(cls) or
-                    self._ANCHOR_HINT_RE.search(id_) or
-                    self._ANCHOR_HINT_RE.search(title) or
-                    self._ANCHOR_HINT_RE.search(aria)
-                ):
-                    resolved_link = urljoin(page.url, href)
+            try: 
+                anchor_pdf = await self.try_pdf_url(anchor)
+            except Exception as e:
+                anchor_pdf = None
+            if anchor_pdf:
+                print("Extracted PDF via anchor hint.")
+                return anchor_pdf
+        
+        if doi and (cross := self._crossref_fallback(doi)):
+            print("Trying with crossref fallback.")
 
-                    try:
-                        anchor_response = await self.try_pdf_url(resolved_link)
-                        # response = await context.request.get(resolved_link)
-                        # if response.status == 200 and "pdf" in response.headers.get("content-type", "").lower():
-                        #     #log extraction 
-                        #     content = await response.body()
-                        #     text = extract_pdf(content)
-                        #     if text: return text
-                    except Exception as e: 
-                        if anchor_response:
-                            return anchor_response
+            try: 
+                cross_ref_pdf = await self.try_pdf_url(cross)
+            except Exception as e:
+                cross_ref_pdf = None
+            if cross_ref_pdf:
+                print("Extracted PDF via CrossRef fallback.")
+                return cross_ref_pdf
+                
+        print("Trying with browser automation to extract PDF.")
+        try:
+            browser_pdf = await self.fetch_pdf_with_browser(landing)
+        except Exception as e:
+            browser_pdf = None
+        if browser_pdf:
+            print("Extrated PDF via browser automation.")
+            return browser_pdf
+        
 
-        return None
+        raise self.CantDownload(doi , landing)
+
+    
