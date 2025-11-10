@@ -3,7 +3,7 @@ import json
 import logging
 
 
-class bioarxiv_api: 
+class bioarxiv_reader: 
 
     def __init__(self):
         self.http = urllib3.PoolManager()

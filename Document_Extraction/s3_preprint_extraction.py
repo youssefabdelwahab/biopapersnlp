@@ -1,451 +1,239 @@
-import sys
+import atexit
 import os
-import json 
-from dotenv import load_dotenv
-import asyncio
-import pdfplumber
-import aiofiles
-import requests
-
-
-
-
-cwd = os.getcwd()
-parent_folder = os.path.abspath(os.path.join(cwd, ".."))
-if parent_folder not in sys.path:
-    sys.path.append(parent_folder)
-
-
-from functions_and_classes import  functions
-from functions_and_classes import bioarxiv_class
-from functions_and_classes.paper_to_doi import get_article_info_from_title
-from LLM_Agent.llm_template import LLMAgent
-from functions_and_classes.pdf_resolver import PDFResolver
-import re
+import sys
+import time
+from pathlib import Path
 from typing import Optional
-load_dotenv()
+import requests
+import json
+import argparse
+import math
+import shlex, subprocess, sys
 
-repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-extract_save_folder = os.path.join(repo_root, "papers", "extracted_papers")
-unextracted_save_folder = os.path.join(repo_root, "papers", "unextracted_papers")
-unknown_save_folder = os.path.join(repo_root, "papers", "unknown_papers")
 
-for folder in (extract_save_folder, unextracted_save_folder, unknown_save_folder):
-    os.makedirs(folder, exist_ok=True)
+log_fh  = None
 
-extract_file_name = os.path.join(extract_save_folder, "extracted_papers.jsonl")
-unextracted_file_name = os.path.join(unextracted_save_folder, "unextracted_papers.jsonl")
-unknown_file_name = os.path.join(unknown_save_folder, "unknown_papers.jsonl")
 
-max_llm_concurrency = int(os.getenv("max_llm_concurrency", 8))
-s3_preprint_path = os.getenv("s3_preprint_path")
-cleaning_prompt = """
- The following text is a *partial excerpt* from a research paper. Your task is to:
 
-                        - Clean it up
-                        - Keep only the **main body content**
-                        - Remove footnotes, references, citations, figure captions, and legal disclaimers.
-                        - Ensure proper paragraph structure and readability.
-                        - Preserve the logical order within this chunk only.
-                        - Do not include any commentary, analysis, or information not present in the chunk.
-                        - Do not attempt to infer or hallucinate missing parts from previous or next sections.
-                        - Do not include any commentary 
+def parse_args():
+    ap = argparse.ArgumentParser(description="Serve vLLM and run a pipeline")
+    ap.add_argument("--model-name", required=True, help="HF id or local path to the model")
+    ap.add_argument("--port", type=int, default=8000, help="Port to run the server on (default: 8000)")
+    ap.add_argument("--max-model-len", type=int, default=None, help="Override max tokens; if omitted, model default is used")
+    ap.add_argument("--gpu-memory-utilization", type=float, default=0.9, help="Fraction of GPU memory to use (0–1, default: 0.9)")
+    ap.add_argument("--out-dir", type=Path, required=True, help="Directory to write outputs/logs")
+    ap.add_argument("--markdown", action="store_true", help="If set, save outputs in Markdown format")
+    ap.add_argument("--input-dir", type=Path, required=True, help="Directory containing PDFs")
+    ap.add_argument("--recursive", action="store_true", help="Recurse into subdirectories for PDFs")
+    ap.add_argument("--pattern", default=None, help="Optional additional Path.match() pattern to filter PDFs")
+    return ap.parse_args()
 
-                        This is only one chunk of a longer paper. Treat each chunk independently unless otherwise told.
-                        Return ONLY the cleaned and readable main body text from the input. DO NOT add any commentary, introduction, summary, or instructional text.
-"""
-title_prompt = """
-                You are given a part of the introductory excerpt from a scientific paper.
 
-                Your sole task is to extract and return the **exact title** of the paper, using the rules below. 
-                
-                
-                The title will be found in the first non empty line of the text
+def start_vllm_server(model: str, port: int, max_model_len: Optional[int], gpu_mem: float):
+    job_id = os.environ.get("SLURM_JOB_ID", "local")
+    log_path = Path.home() / "biopapersnlp" / "shell_scripts" / "logs" / f"vllm_{job_id}.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
 
-                Task: from the text below, return **exactly** the paper title or **Title not found**
+    gpu_mem = float(gpu_mem)
+    if math.isnan(gpu_mem) or math.isinf(gpu_mem) or not (0.0 < gpu_mem <= 1.0):
+        raise ValueError("--gpu-memory-utilization must be in (0, 1].")
 
-                Rules (highest priority first)
-                1.return the first non-empty line that appears **before** any line that starts with `Authors` or `Affiliations`.
-                3. If nothing matches, return: Title not found
+    cmd = [ 
+        "vllm", "serve", model, 
+        "--host", "127.0.0.1", 
+        "--port", str(port), 
+        "--gpu-memory-utilization", str(gpu_mem), 
+        "--enforce-eager"
+        ]
 
-                Output format (must follow **exactly**):
-                <plain title>           ← no quotes, no label, no markdown
-                """
-                
-title_patterns= re.compile(
-    r"""(?ix)                  # i = ignore-case, x = free-spacing
-    ^\s*                       # optional leading white-space
-    (?:                        # … followed by one of these phrases
-        title\s*:              |   #  Title:
-        the\s+title\s+is\s*:   |   #  The title is:
-        exact\s+title\s+of\s+the\s+paper\s+is\s*: |  #  Exact title of the paper is:
-        here\s+is\s+the\s+title\s*:                 #  Here is the title:
+    if max_model_len is not None:
+        cmd += ["--max-model-len", str(max_model_len)]
+    global log_fh
+    log_fh = open(log_path, "w")
+
+    # Launch in background, fully detached from this process’ stdio
+    proc = subprocess.Popen(
+        cmd,
+        stdout=log_fh,
+        stderr=subprocess.STDOUT,         
+        stdin=subprocess.DEVNULL,          
+        start_new_session=True,           
+        text=True,                      
+        bufsize=1                        
     )
-    \s*                        # toss any white-space after the label
-    """,
-    re.UNICODE,
-)              
-                
-biorxiv_api = bioarxiv_class.bioarxiv_api()
-api_key = os.getenv("API_KEY")
-model_name = 'Llama-3-8B-Instruct-exl2'
-agent = LLMAgent(model_name)
 
-llm_semaphore = asyncio.Semaphore(max_llm_concurrency)
-
-async def retry_biorxiv(doi: str, preprint: bool):
-    loop = asyncio.get_running_loop()
-    for attempt in range(3):
+    def _cleanup():
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=30)
+            except Exception:
+                proc.kill()
         try:
-            return await loop.run_in_executor(None, biorxiv_api.request_specific_preprint, preprint, doi)
-        except requests.RequestException:
-            await asyncio.sleep(1 * (2 ** attempt))
-    return None
+            log_fh.close()
+        except Exception:
+            pass
+    atexit.register(_cleanup)
 
-async def call_llm(system_prompt: str, user_prompt: str) -> str:
-    loop = asyncio.get_running_loop()
-    async with llm_semaphore:
-        return await loop.run_in_executor(None, agent.one_turn, system_prompt, user_prompt)
+    print(f"[INFO] Started vLLM pid={proc.pid}, logging to {log_path}")
+    return proc, log_fh
     
-async def process_pdf(path: str):
-    paper_chunks = []
-    loop = asyncio.get_running_loop()
+
+def wait_for_vllm_health(
+    port: int,
+    proc: Optional["subprocess.Popen"] = None,   # pass the Popen if you have it
+    max_wait_min: int = 60,
+    sleep_secs: float = 2.0,
+        ) -> None:
+    """Poll http://127.0.0.1:{port}/health until 200 OK, or fail on timeout/proc exit."""
+
+    deadline = time.monotonic() + max_wait_min * 60
+    base = f"http://127.0.0.1:{port}"
+    print("[INFO] Waiting for vLLM to become healthy", end="", flush=True)
+
+    while True:
+        # Success case
+        try:
+            r = requests.get(f"{base}/health", timeout=2)
+            if r.status_code == 200:
+                print()  # newline after dots
+                return
+        except Exception:
+            pass
+
+        # Process died?
+        if proc is not None and proc.poll() is not None:
+            print("\n[ERROR] vLLM process is no longer running.", file=sys.stderr)
+            raise RuntimeError("vLLM server died before becoming healthy")
+
+        # Timeout?
+        if time.monotonic() >= deadline:
+            print(f"\n[ERROR] Timeout waiting for vLLM (>{max_wait_min} min).", file=sys.stderr)
+            raise TimeoutError("Timed out waiting for vLLM /health")
+
+        # Wait and print a dot
+        time.sleep(sleep_secs)  
+        print(".", end="", flush=True)
+
+
+
+def api_call_check( 
+    model_name:str, 
+    port:int
+    ) -> None: 
+    base = f"http://127.0.0.1:{port}"
+
+    try: 
+        r = requests.get(f"{base}/v1/models", timeout = 5)
+        r.raise_for_status()
+    except requests.RequestException as e: 
+        raise RuntimeError(f"Failed to reach vLLM at {base}:{e}")
+    
+    data = r.json()
+    print(json.dumps(data, indent = 2))
+
+    names = {m.get("id") for m in data.get("data", [])}
+    if model_name not in names: 
+        raise RuntimeError( 
+            "Model '{model_name}' not listed by /v1/models. Found: {sorted(names)}"
+        )
+        
+
+def run_olmocr_pipeline(port: int, input_dir: Path, out_dir: Path, markdown: bool, log_fh):
+    server = f"http://127.0.0.1:{port}/v1"
+
+
+
+    cmd_str = (
+        f"{shlex.quote(sys.executable)} -m olmocr.pipeline "
+        f"{shlex.quote(str(out_dir))} "
+        + ("--markdown " if markdown else "")
+        + f"--server {shlex.quote(server)} "
+        f"--pdfs {shlex.quote(str(input_dir))}/*.pdf"
+    )
+ 
+    print("[INFO] Running:", cmd_str)
+
+    ret = subprocess.run(
+        cmd_str,
+        shell=True,             
+        stdout=log_fh,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+    )
+    if ret.returncode != 0:
+        print("[ERROR] olmocr pipeline failed", file=sys.stderr)
+        sys.exit(ret.returncode)
+    print("[INFO] Pipeline finished successfully")
+    print(f"[INFO] Done. Outputs in: {out_dir}")
+
+def list_pdfs(base: Path, recursive: bool, pattern: str | None):
+    if recursive:
+        it = base.rglob("*.pdf")
+        it2 = base.rglob("*.PDF")
+    else:
+        it = base.glob("*.pdf")
+        it2 = base.glob("*.PDF")
+    files = list(it) + list(it2)
+    if pattern:
+        # simple post-filter using Path.match
+        files = [p for p in files if p.match(pattern)]
+    return sorted(set(files))
+
+
+def main(): 
+
+
+    args = parse_args()
+
+    proc, log_fh = start_vllm_server(
+    model=args.model_name,
+    port=args.port,
+    max_model_len=args.max_model_len,
+    gpu_mem=args.gpu_memory_utilization,
+    )
+
+    wait_for_vllm_health(port=args.port, proc=proc)
+
+
+    api_call_check(model_name=args.model_name, port=args.port)
+
+
+
+    pdfs = list_pdfs(args.input_dir, recursive=args.recursive, pattern=args.pattern)
+    if not pdfs:
+        print(f"[ERROR] No PDFs found in {args.input_dir}", file=sys.stderr)
+        sys.exit(2)
+
+    print("Found PDFS")
+    print("Executing Olmocr Pipeline")
+
+ 
+
     try:
-        with pdfplumber.open(path) as pdf:
-            for page_num, page in enumerate(pdf.pages, 1):
-                try:
-                    page_text = page.extract_text() or ""
-                except Exception:
-                    continue
-                if not page_text.strip():
-                    continue
-                page_chunks = functions.chunk_text_by_char_limit(page_text, limit=7500)
-                page_chunks_cleaned = await asyncio.gather(*(call_llm(cleaning_prompt, c) for c in page_chunks))
-                paper_chunks.append(" ".join(page_chunks_cleaned))
-    except Exception:
-        return []
-    return paper_chunks
-    
-async def extract_text_with_pdf_resolver(doi: str, paper_id, selector_timeout:int) -> str: 
-    """
-        Resolve *doi* → PDF → text using the new async PDFResolver.
-
-    • Tries all resolver logic (Springer, OUP, Wiley, Playwright fallback…)
-    • Downloads the PDF URL it finds
-    • Extracts text with your existing `pdf_parser.extract_text_from_pdf_url`
-    • Returns *None* if nothing could be extracted
-    """
-    async with PDFResolver(selector_timeout= selector_timeout) as resolver: 
+        run_olmocr_pipeline(
+            port=args.port,
+            input_dir= args.input_dir,  # or pass expanded list if olmocr supports multiple
+            out_dir=args.out_dir,
+            markdown=args.markdown,
+            log_fh=log_fh,
+        )
+    finally:
+        # Stop server explicitly; atexit also cleans up
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
         try:
-            pdf = await resolver.get_pdf(doi=doi, paper_id=paper_id)
-            return pdf
-        except resolver.CantDownload as exc: 
-            #print 
-            return {"url":exc.landing}
+            log_fh.close()
+        except Exception:
+            pass
 
-def remove_newlines(text: str) -> str:
-        """
-        Removes all newline characters from the input string.
-
-        Args:
-            text (str): The input string.
-
-        Returns:
-            str: The string with all '\n' characters removed.
-        """
-        return text.replace("\n", "")
-
-def clean_title(raw: str) -> Optional[str]:
-    """
-    Remove leading label phrases & any stray ':' or ';'.
-    Returns the cleaned title, or *None* if nothing is left.
-    """
-    if raw is None:
-        return None
-
-    # 1) strip the label if present
-    text = title_patterns.sub("", raw)
-
-    # 2) strip leading / trailing colons, semicolons & white-space
-    text = text.strip(" :;\n\t\r")
-
-    # 3) collapse internal runs of white-space to a single space
-    text = re.sub(r"\s+", " ", text).strip()
-
-    return text or None   # return None when only labels were present
-
-
-counter = 0
-counter_lock = asyncio.Lock()
-async def extract_preprint_and_published_papers(extracted_q, unextracted_q, unknown_q):
-    global counter
-    loop = asyncio.get_event_loop()
-
-    for paper in os.listdir(s3_preprint_path):
-        if paper.endswith(".pdf"):
-            paper_path = os.path.join(s3_preprint_path, paper)
-        else:
-            print(f"Skipping {paper}, not a PDF file.")
-            continue
-        print(f"Processing paper: {paper}")
-        research_text_bucket = {
-            "preprint_paper": None,
-            "published_paper": None
-                }
-        paper_dict = {
-            "preprint_pdf_name": paper,
-            "preprint_doi": "",
-            "published_doi": "",
-            "published_journal": "",
-            "preprint_title": "",
-            "preprint_authors": "",
-            "preprint_category": "",
-            "preprint_date": "",
-            "published_date": "",
-            "preprint_author_corresponding": "",
-            "preprint_author_corresponding_institution": "",
-            "preprint_paper": "",
-            "published_paper": "",
-            'url': None
-        }
-        
-        
-        preprint_chunks = await process_pdf(paper_path) 
-        if not preprint_chunks: 
-            await unknown_q.put(paper_dict); continue   
-        preprint_cleaned_text = " ".join(preprint_chunks)
-        research_text_bucket.update({
-            "preprint_paper": preprint_cleaned_text
-        })
-        intro_paragraph = str(preprint_chunks[0])
-        intro_paragraph_cleaned = remove_newlines(intro_paragraph)
-        
-        paper_title  = await call_llm(title_prompt, intro_paragraph_cleaned)
-        paper_title_cleaned = clean_title(paper_title)
-
-        if paper_title_cleaned == "Title not found":
-            print(f"Title not found for {paper_path}")
-            #extract preprint and save it to unknown_preprints folder
-            paper_dict.update({
-                "preprint_pdf_name": paper,
-                "preprint_doi": None,
-                "published_doi":None,
-                "published_journal": None,
-                "preprint_title": paper_title_cleaned,
-                "preprint_authors": None,
-                "preprint_category": None,
-                "preprint_date": None,
-                "published_date": None,
-                "preprint_author_corresponding": None,
-                "preprint_author_corresponding_institution": None,
-                "preprint_paper": research_text_bucket["preprint_paper"],
-                "published_paper": None
-            })
-            await unknown_q.put(paper_dict)
-            continue
-        
-        print(f"Paper Title Found , {paper_title_cleaned} ")
-        preprint_info = get_article_info_from_title(paper_title_cleaned)
-        
-        if preprint_info is None or preprint_info.get("doi") is None:
-            print(f"Could not find preprint doi for {paper_title_cleaned}")
-            #save it to unknown_preprints folder
-            paper_dict.update({
-                'preprint_pdf_name': paper,
-                "preprint_doi": None,
-                "published_doi":None,
-                "published_journal": None,
-                "preprint_title": paper_title_cleaned,
-                "preprint_authors": None,
-                "preprint_category": None,
-                "preprint_date": None,
-                "published_date": None,
-                "preprint_author_corresponding": None,
-                "preprint_author_corresponding_institution": None,
-                "preprint_paper": research_text_bucket["preprint_paper"],
-                "published_paper": None
-            })
-            await unknown_q.put(paper_dict)
-            continue
-        
-        print(f"Preprint DOI found: {preprint_info['doi']}, proceeding with extraction")
-        preprint_doi = preprint_info.get("doi")
-        preprint_paper_metadata = await retry_biorxiv(preprint_doi, preprint=True)
-        preprint_coll = (preprint_paper_metadata or {}).get("collection", [])
-        if not preprint_coll:
-            print(f"preprint info was not found on biorxiv")
-            paper_dict.update({
-                'preprint_pdf_name': paper,
-                "preprint_doi": None,
-                "published_doi":None,
-                "published_journal": None,
-                "preprint_title": paper_title_cleaned,
-                "preprint_authors": None,
-                "preprint_category": None,
-                "preprint_date": None,
-                "published_date": None,
-                "preprint_author_corresponding": None,
-                "preprint_author_corresponding_institution": None,
-                "preprint_paper": research_text_bucket["preprint_paper"],
-                "published_paper": None
-            })
-            await unknown_q.put(paper_dict)
-            continue
-        print("preprint info found on biorxiv")
-        latest_preprint = preprint_coll[-1]
-        published_doi = latest_preprint.get('published')
-        
-        if published_doi == "NA":
-            print("Preprint has not been published yet, storing preprint")
-            #store its metadata information and save it to unextracted_papers
-            paper_dict.update({
-                'preprint_pdf_name': paper,
-                "preprint_doi": latest_preprint.get('doi'),
-                "published_doi":None,
-                "published_journal": None,
-                "preprint_title": paper_title_cleaned,
-                "preprint_authors": latest_preprint.get('authors'),
-                "preprint_category": latest_preprint.get('category'),
-                "preprint_date": latest_preprint.get('date'),
-                "published_date": None,
-                "preprint_author_corresponding": latest_preprint.get('author_corresponding'),
-                "preprint_author_corresponding_institution": latest_preprint.get('author_corresponding_institution'),
-                "preprint_paper": research_text_bucket["preprint_paper"],
-                "published_paper": None
-            })
-            await unextracted_q.put(paper_dict)
-            continue        
-        
-        published_paper_metadata = await retry_biorxiv(published_doi, preprint=False)
-        published_coll = (published_paper_metadata or {}).get("collection", [])
-        if not published_coll:
-            print(f"published info was not found on biorxiv for {paper_title_cleaned} storing preprint")
-            paper_dict.update({
-                'preprint_pdf_name': paper,
-                "preprint_doi": latest_preprint.get('doi'),
-                "published_doi":None,
-                "published_journal": None,
-                "preprint_title": paper_title_cleaned,
-                "preprint_authors": latest_preprint.get('authors'),
-                "preprint_category": latest_preprint.get('category'),
-                "preprint_date": latest_preprint.get('date'),
-                "published_date": None,
-                "preprint_author_corresponding": latest_preprint.get('author_corresponding'),
-                "preprint_author_corresponding_institution": latest_preprint.get('author_corresponding_institution'),
-                "preprint_paper": research_text_bucket["preprint_paper"],
-                "published_paper": None
-            })
-            await unextracted_q.put(paper_dict)
-            continue
-        print("published info found on biorxiv")
-        latest_pub = published_coll[0]
-        confirmed_published_doi = latest_pub.get('published_doi')        
-        published_text = None
-        url = None
-        try:
-            published_result = await extract_text_with_pdf_resolver(doi = confirmed_published_doi, paper_id= confirmed_published_doi, selector_timeout=40_000 )
-            if isinstance(published_result, dict) and 'url' in published_result: 
-                #log failure 
-                published_text = None
-                url = published_result['url']
-            else: 
-                published_text = published_result
-        except asyncio.TimeoutError as e:
-            print("Async timeout fetching published PDF for %s: %s", paper, e)
-        except Exception as e:
-            print(f"Error extracting published paper: {e}")
-        if published_text:
-            print("Successfully extracted published paper")
-            published_chunks = functions.chunk_text_by_char_limit(published_text, limit=7500)
-        
-            
-            published_cleaned_chunks = await asyncio.gather(*(call_llm(cleaning_prompt, c) for c in published_chunks))
-            published_cleaned_text = " ".join(published_cleaned_chunks)
-            research_text_bucket.update({
-                "published_paper" : published_cleaned_text
-            })
-            paper_dict.update({
-            'preprint_pdf_name': paper,
-            "preprint_doi": latest_pub.get('preprint_doi'),
-            "published_doi": latest_pub.get('published_doi'),
-            "published_journal": latest_pub.get('published_journal'),
-            "preprint_title": paper_title_cleaned,
-            "preprint_authors": latest_pub.get('preprint_authors'),
-            "preprint_category": latest_pub.get('preprint_category'),
-            "preprint_date": latest_pub.get('preprint_date'),
-            "published_date": latest_pub.get('published_date'),
-            "preprint_author_corresponding": latest_pub.get('preprint_author_corresponding'),
-            "preprint_author_corresponding_institution": latest_pub.get('preprint_author_corresponding_institution'),
-            "preprint_paper": research_text_bucket["preprint_paper"],
-            "published_paper": research_text_bucket["published_paper"]
-            })
-        
-            await extracted_q.put(paper_dict)
-            async with counter_lock:
-                counter += 1
-            print(f"preprint and published extracted for {paper_title_cleaned}")
-            print(f"Total papers extracted so far: {counter}")
-
-            if counter == 1000: 
-                break
-        else:
-            print(f"Could not extract text from {confirmed_published_doi}, storing preprint only")
-            paper_dict.update({
-                'preprint_pdf_name': paper,
-                "preprint_doi": latest_pub.get('preprint_doi'),
-                "published_doi": latest_pub.get('published_doi'),
-                "published_journal": latest_pub.get('published_journal'),
-                "preprint_title": paper_title_cleaned,
-                "preprint_authors": latest_pub.get('preprint_authors'),
-                "preprint_category": latest_pub.get('preprint_category'),
-                "preprint_date": latest_pub.get('preprint_date'),
-                "published_date": latest_pub.get('published_date'),
-                "preprint_author_corresponding": latest_pub.get('preprint_author_corresponding'),
-                "preprint_author_corresponding_institution": latest_pub.get('preprint_author_corresponding_institution'),
-                "preprint_paper": research_text_bucket["preprint_paper"],
-                "published_paper": None, 
-                "url": url
-                })
-            await unextracted_q.put(paper_dict)
-            continue 
-            
-        
-async def writer(path, queue):
-    async with aiofiles.open(path, 'a') as f:
-        while True:
-            item = await queue.get()
-            if item is None:
-                break
-            await f.write(json.dumps(item) + "\n")
-
-async def main():
-
-    
-    extracted_q = asyncio.Queue()
-    unextracted_q = asyncio.Queue()
-    unknown_q = asyncio.Queue()
-    
-    
-    extract_task = asyncio.create_task(
-        extract_preprint_and_published_papers(extracted_q, unextracted_q, unknown_q)
-    )
-    
-    writer_task1 = asyncio.create_task(writer(extract_file_name, extracted_q))
-    writer_task2 = asyncio.create_task(writer(unextracted_file_name, unextracted_q))
-    writer_task3 = asyncio.create_task(writer(unknown_file_name, unknown_q))
-
-
-    await extract_task
-    
-    await extracted_q.put(None)
-    await unextracted_q.put(None)
-    await unknown_q.put(None)
-    
-    
-    await asyncio.gather(writer_task1, writer_task2, writer_task3)
-
-    print(f"Completed extraction of {counter} papers.")
-    
 if __name__ == "__main__":
-    asyncio.run(main())
-    print("Extraction completed. Check the output files for results.")
+    main()
+    
+
+    

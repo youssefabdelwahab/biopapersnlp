@@ -9,7 +9,7 @@ sys.path.append(parent_folder)
 from dotenv import load_dotenv
 import asyncio
 import csv
-from functions_and_classes.bioarxiv_class import *
+from functions_and_classes.bioarxiv_reader import *
 from functions_and_classes.functions import *
 from LLM_Agent.llm_template import LLMAgent
 from selenium.common.exceptions import TimeoutException
