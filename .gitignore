@@ -34,5 +34,37 @@ archived_papers/
 
 Document_Extraction/preprint_test.ipynb/
 
+Document_Extraction/s3_line_test.py
+
 
 biopapers/
+biopapersvllm/
+
+slurm_scripts/
+
+flashattention/
+
+flash-attention/flashattention.sbatch
+flash-attention/flashattn.err
+flash-attention/flashattn.out
+
+exallamav2/
+
+env_vars.sh
+
+builds/
+build_tools/
+
+functions_and_classes/distribute_papers.py
+
+logs/
+
+testing/
+
+shell_scripts/build_exl2.sh
+shell_scripts/build_flsh_attn.sh
+shell_scripts/inline_extraction.sh
+shell_scripts/setup_docling.sh
+shell_scripts/olcr_pdf_extract.sh
+setup_folder/
+general_logs/

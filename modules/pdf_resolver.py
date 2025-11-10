@@ -198,8 +198,12 @@ class PDFResolver:
         pass 
         
     class MissingIdentifier(PDFResolverError):
-        """Neither DOI nor landing URL was supplied."""
-        pass 
+        """
+        Raised when the DOI is missing 
+        """
+        def __init__(self ,error_message:str): 
+            self.error_message = error_message
+            super().__init__(f"{error_message}")
     
     class CantDownload(Exception):
         """

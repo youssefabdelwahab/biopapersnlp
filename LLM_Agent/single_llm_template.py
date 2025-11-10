@@ -65,7 +65,7 @@ class LLMAgent:
     def one_turn(self, 
                 system_prompt, 
                 user_prompt,
-                temperature=0.7,
+                temperature=0.1,
                 stop=None
                 ):
     # Create a chat completion
